@@ -14,7 +14,8 @@ from modules.selective_scan_cuda_torch import SelectiveScanCudaTorch
 from modules.selective_scan_split import SelectiveScanSplit
 
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref, selective_scan_naiv, mamba_inner_fn
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref, selective_scan_naiv, \
+        mamba_inner_fn
 except ImportError:
     pass
 
@@ -66,6 +67,7 @@ class MultiLinearLayer(nn.Module):
     @property
     def device(self):
         return getattr(self, next(iter(self.names_dims.keys()))).weight.device
+
     @property
     def dtype(self):
         return getattr(self, next(iter(self.names_dims.keys()))).weight.dtype
@@ -79,7 +81,8 @@ class MultiLinearLayer(nn.Module):
         weights = [l.weight for l in layers]
         weight = torch.cat(weights, dim=0)
 
-        l = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device=layers[0].weight.device, dtype=layers[0].weight.dtype)
+        l = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device=layers[0].weight.device,
+                      dtype=layers[0].weight.dtype)
 
         with torch.no_grad():
             l.weight[:] = weight
@@ -95,25 +98,25 @@ class MultiLinearLayer(nn.Module):
 
 class MambaPeft(nn.Module):
     def __init__(
-        self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        conv_bias=True,
-        bias=False,
-        use_fast_path=False,  # Fused kernel options
-        layer_idx=None,
-        device=None,
-        dtype=None,
-        backend="cuda",
-        attn_implementation=None,
+            self,
+            d_model,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            dt_rank="auto",
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            conv_bias=True,
+            bias=False,
+            use_fast_path=False,  # Fused kernel options
+            layer_idx=None,
+            device=None,
+            dtype=None,
+            backend="cuda",
+            attn_implementation=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -127,9 +130,9 @@ class MambaPeft(nn.Module):
         self.layer_idx = layer_idx
 
         self.selective_scan_fn = {
-            "cuda": lambda: selective_scan_fn, 
-            "cuda_torch": lambda: SelectiveScanCudaTorch(), 
-            "ref": lambda: selective_scan_ref, 
+            "cuda": lambda: selective_scan_fn,
+            "cuda_torch": lambda: SelectiveScanCudaTorch(),
+            "ref": lambda: selective_scan_ref,
             "naiv": lambda: selective_scan_naiv,
             "torch_logcumsumexp": lambda: SelectiveScanTorch("logcumsumexp"),
             "torch_logcumsumexp_compile": lambda: torch.compile(SelectiveScanTorch("logcumsumexp")),
@@ -160,7 +163,7 @@ class MambaPeft(nn.Module):
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        dt_init_std = self.dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
         elif dt_init == "random":
@@ -196,20 +199,27 @@ class MambaPeft(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-
         all_dims = {
             "b": -1, "d": self.d_inner, "l": -1, "n": self.d_state
         }
         self.parameter_processors = nn.ModuleDict({
-            "A_log": ParameterProcessor("A_log", shape=[self.d_inner, self.d_state], dim_names="dn", dtype=torch.float32, device=device, all_dims=all_dims, param=A),
-            "A": ParameterProcessor("A", [self.d_inner, self.d_state], dim_names="dn", dtype=torch.float32, device=device, all_dims=all_dims),
-            "B": ParameterProcessor("B", [-1, self.d_state, -1], dim_names="bnl", dtype=dtype, device=device, all_dims=all_dims),
-            "C": ParameterProcessor("C", [-1, self.d_state, -1], dim_names="bnl", dtype=dtype, device=device, all_dims=all_dims),
-            "D": ParameterProcessor("D", [self.d_inner], dim_names="d", dtype=torch.float32, device=device, all_dims=all_dims, param=self.D),
-            "dt": ParameterProcessor("dt", [-1, self.d_state, -1], dim_names="bdl", dtype=dtype, device=device, all_dims=all_dims),
+            "A_log": ParameterProcessor("A_log", shape=[self.d_inner, self.d_state], dim_names="dn",
+                                        dtype=torch.float32, device=device, all_dims=all_dims, param=A),
+            "A": ParameterProcessor("A", [self.d_inner, self.d_state], dim_names="dn", dtype=torch.float32,
+                                    device=device, all_dims=all_dims),
+            "B": ParameterProcessor("B", [-1, self.d_state, -1], dim_names="bnl", dtype=dtype, device=device,
+                                    all_dims=all_dims),
+            "C": ParameterProcessor("C", [-1, self.d_state, -1], dim_names="bnl", dtype=dtype, device=device,
+                                    all_dims=all_dims),
+            "D": ParameterProcessor("D", [self.d_inner], dim_names="d", dtype=torch.float32, device=device,
+                                    all_dims=all_dims, param=self.D),
+            "dt": ParameterProcessor("dt", [-1, self.d_state, -1], dim_names="bdl", dtype=dtype, device=device,
+                                     all_dims=all_dims),
             # "z": ParameterProcessor("z", [-1, self.d_inner, -1], dim_names="bdl", dtype=dtype, device=device),
-            "x_after_conv": ParameterProcessor("x_after_conv", [-1, self.d_inner, -1], dim_names="bdl", dtype=dtype, device=device, all_dims=all_dims),
-            "x_after_ssm": ParameterProcessor("x_after_ssm", [-1, self.d_inner, -1], dim_names="bdl", dtype=dtype, device=device, all_dims=all_dims)
+            "x_after_conv": ParameterProcessor("x_after_conv", [-1, self.d_inner, -1], dim_names="bdl", dtype=dtype,
+                                               device=device, all_dims=all_dims),
+            "x_after_ssm": ParameterProcessor("x_after_ssm", [-1, self.d_inner, -1], dim_names="bdl", dtype=dtype,
+                                              device=device, all_dims=all_dims)
         })
 
     def split_layers(self):
@@ -303,7 +313,7 @@ class MambaPeft(nn.Module):
             if causal_conv1d_fn is None:
                 x = self.conv1d(x)
                 # x = self.act(x[..., :seqlen])
-                x = self.act(x[..., :-(self.d_conv-1)])
+                x = self.act(x[..., :-(self.d_conv - 1)])
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
@@ -322,7 +332,7 @@ class MambaPeft(nn.Module):
 
             if isinstance(x_dbl, (tuple, list)):
                 dt, B, C = x_dbl
-            else: 
+            else:
                 dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             # dt = self.dt_proj.weight @ dt.t()
             dt = self.dt_proj(dt)
@@ -340,7 +350,7 @@ class MambaPeft(nn.Module):
 
             if B.ndim == 4 and C.ndim == 3:
                 C = repeat(C, "b n l -> b d n l", d=B.shape[1])
-            
+
             if B.ndim == 3 and C.ndim == 4:
                 B = repeat(B, "b n l -> b d n l", d=C.shape[1])
 
@@ -377,7 +387,7 @@ class MambaPeft(nn.Module):
                 y, last_state = y
                 ssm_state.copy_(last_state)
             y = self.process_parameter("x_after_ssm", y, z=z, A=A, B=B, C=C, D=D, dt=dt)
-            
+
             y = rearrange(y, "b d l -> b l d")
 
             if rem_prefix_with_lora:
@@ -412,7 +422,7 @@ class MambaPeft(nn.Module):
             else:
                 x = self.conv1d(conv_state)
                 x = x[..., x.shape[-1] // 2]
-            
+
             x = self.act(x).to(dtype=dtype)
         else:
             x = causal_conv1d_update(
@@ -422,14 +432,14 @@ class MambaPeft(nn.Module):
                 self.conv1d.bias,
                 self.activation,
             )
-        
+
         x = self.process_parameter("x_after_conv", x)
 
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
 
         if isinstance(x_db, (tuple, list)):
             dt, B, C = x_db
-        else: 
+        else:
             dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         # Don't add dt_bias here
         # dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
@@ -449,7 +459,7 @@ class MambaPeft(nn.Module):
 
         if B.ndim == 3 or C.ndim == 3 or selective_state_update is None:
             # Discretize A and B
-            dt = F.softplus(dt)  #  + self.dt_proj.bias.to(dtype=dt.dtype)
+            dt = F.softplus(dt)  # + self.dt_proj.bias.to(dtype=dt.dtype)
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn" if B.ndim == 2 else "bd,bdn->bdn", dt, B)
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
@@ -460,7 +470,7 @@ class MambaPeft(nn.Module):
             y = selective_state_update(
                 ssm_state, x, dt, A, B, C, D, z=z, dt_bias=None, dt_softplus=True
             )
-        
+
         y = self.process_parameter("x_after_ssm", y, z=z, A=A, B=B, C=C, D=D, dt=dt)
 
         out = self.out_proj(y)
@@ -516,7 +526,7 @@ class MambaPeft(nn.Module):
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False, **kwargs,
+            self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False, **kwargs,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -542,7 +552,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
     ):
         r"""Pass the input through the encoder layer.
 

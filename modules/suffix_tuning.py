@@ -1,4 +1,3 @@
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import enum
@@ -16,17 +15,16 @@ from modules.mamba_peft_utils import MambaPeftType, register_peft_config, regist
 from modules.mamba_tuner_utils import MambaBaseTuner
 
 
-
 class SuffixTuningBiasType(str, enum.Enum):
     SILU_Z = "SILU_Z"
     SILU_Z_C = "SILU_Z_C"
+    # NEW: DSOT — dynamic state offset modulated by causal context of silu(z)
+    DYNAMIC_SILU_Z_C = "DYNAMIC_SILU_Z_C"
 
 
 class SuffixTuningBiasInit(str, enum.Enum):
     ZERO = "ZERO"
     RANDOM = "RANDOM"
-
-
 
 
 class LoraParam(nn.Module):
@@ -109,12 +107,33 @@ class SuffixTuningModel(MambaBaseTuner):
         if target_name == "x_after_ssm":
             new_module = SuffixTuningBiasProcessor(
                 target, adapter_name,
-                bias_type=peft_config.bias_type, 
-                bias_init=peft_config.bias_init, 
+                bias_type=peft_config.bias_type,
+                bias_init=peft_config.bias_init,
                 r=peft_config.r, dropout=peft_config.dropout, r_ratio=peft_config.r_ratio
             )
 
         return new_module
+
+
+def _causal_cumavg(x, dim=-1):
+    """
+    Causal cumulative average along given dim.
+    c_t = (1/t) * sum_{i=1}^{t} x_i
+
+    Args:
+        x: tensor of arbitrary shape
+        dim: dimension along which to compute cumavg
+    Returns:
+        c: same shape as x
+    """
+    cum = torch.cumsum(x, dim=dim)
+    length = x.size(dim)
+    denom = torch.arange(1, length + 1, device=x.device, dtype=x.dtype)
+    # reshape denom to broadcast along the chosen dim
+    shape = [1] * x.ndim
+    shape[dim] = length
+    denom = denom.view(shape)
+    return cum / denom
 
 
 class SuffixTuningBiasProcessor(nn.Module, BaseTunerLayer):
@@ -150,10 +169,12 @@ class SuffixTuningBiasProcessor(nn.Module, BaseTunerLayer):
     def update_layer(self, adapter_name, bias_type, bias_init, r=None, dropout=None, r_ratio=None):
         dims = self.base_layer.all_dims
 
-        # xor
+        # Parameter shape for each bias type.
+        # DSOT uses the same shape as SILU_Z_C, ensuring identical parameter count to SOT.
         shape = {
             SuffixTuningBiasType.SILU_Z_C: [dims["d"], dims["n"]],
             SuffixTuningBiasType.SILU_Z: [dims["d"]],
+            SuffixTuningBiasType.DYNAMIC_SILU_Z_C: [dims["d"], dims["n"]],
         }[bias_type]
 
         param = self._create_param(shape, bias_init, self.base_layer.dtype, self.base_layer.device,
@@ -174,7 +195,7 @@ class SuffixTuningBiasProcessor(nn.Module, BaseTunerLayer):
                 param = param()
 
             bias_type = self.suffixtuning_type[active_adapter]
-            
+
             no_seqlen_dim = z.ndim == 2
 
             if no_seqlen_dim:
@@ -183,9 +204,27 @@ class SuffixTuningBiasProcessor(nn.Module, BaseTunerLayer):
 
             match bias_type:
                 case SuffixTuningBiasType.SILU_Z_C:
+                    # SOT (original):
+                    # y_add[b,d,l] = sum_n silu(z)[b,d,l] * C[b,n,l] * h'[d,n]
                     y_add = torch.einsum("bdl,bnl,dn -> bdl", F.silu(z), C, param)
+
                 case SuffixTuningBiasType.SILU_Z:
                     y_add = torch.einsum("bdl,d -> bdl", F.silu(z), param)
+
+                case SuffixTuningBiasType.DYNAMIC_SILU_Z_C:
+                    # DSOT (Dynamic State-Offset Tuning):
+                    # y_add[b,d,l] = sum_n silu(z)[b,d,l] * C[b,n,l] * h'[d,n] * c[b,d,l]
+                    # 
+                    # where c[b,d,l] is the causal cumulative average of silu(z)
+                    # along the sequence dimension:
+                    #     c[b,d,l] = (1/(l+1)) * sum_{i=0}^{l} silu(z)[b,d,i]
+                    #
+                    # SOT is recovered when c = 1 (i.e., a degenerate "static" context).
+
+                    z_silu = F.silu(z)  # (B, D, L)
+                    c = _causal_cumavg(z_silu, dim=-1)  # (B, D, L)
+                    z_silu_modulated = z_silu * c  # (B, D, L)
+                    y_add = torch.einsum("bdl,bnl,dn -> bdl", z_silu_modulated, C, param)
 
             if no_seqlen_dim:
                 y_add = y_add.squeeze(2)
@@ -193,4 +232,3 @@ class SuffixTuningBiasProcessor(nn.Module, BaseTunerLayer):
             y = y + y_add
 
         return y
-

@@ -30,4 +30,4 @@ checkpoint-*
 sync_git.py
 /test_run
 /wandb
-/untracked
+/untracked.idea/
