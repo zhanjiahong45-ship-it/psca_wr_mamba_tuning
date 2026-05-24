@@ -1,5 +1,7 @@
 
 import os
+from pathlib import Path
+
 from mamba_ssm.modules.mamba_simple import Mamba
 
 from .mamba_peft import MambaPeft
@@ -7,10 +9,10 @@ from .mixer_seq_simple import MambaLMHeadModelPeft
 
 import torch
 import json
+from types import SimpleNamespace
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from pathlib import Path
 from peft import PeftModelForSeq2SeqLM
 
 from peft import get_peft_model, PeftConfig, PeftType
@@ -141,12 +143,83 @@ def load_mamba_peft(path):
     ckpt = torch.load(path / "peft.pt")
     train_state_dict = ckpt["state_dict"]
     model_args = ckpt["model_args"]
-    peft_args = ckpt["peft_args"]
+    peft_args = {**ckpt["peft_args"]}
+    deep_supervision_args = peft_args.pop("deep_supervision", None)
 
     model_tokenizer = load_mamba_full(**model_args, apply_fixes=False)
     model = model_tokenizer["model"]
     tokenizer = model_tokenizer["tokenizer"]
-    model, _ = get_mamba_peft_model(model, return_peft_cfg=True, no_print=True, **peft_args)
+    peft_cfg = peft_args.get("peft")
+    from modules.sdft import freeze_for_sdft, freeze_lm_head_weight_for_sdft, inject_sdft_adapters, is_sdft_config_dict, merge_sdft_config
+    from modules.pd_dft import (
+        freeze_lm_head_weight_for_pd_dft,
+        inject_pd_dft_adapters,
+        is_pd_dft_config_dict,
+        mark_only_pd_dft_as_trainable,
+        merge_pd_dft_config,
+    )
+    from modules.snoft import (
+        inject_snoft_adapters,
+        is_snoft_config_dict,
+        mark_only_snoft_as_trainable,
+        merge_snoft_config,
+        print_snoft_summary,
+    )
+    from modules.psca_wr import (
+        inject_psca_wr_adapters,
+        is_psca_wr_config_dict,
+        mark_only_psca_wr_as_trainable,
+        merge_psca_wr_config,
+        print_psca_wr_summary,
+    )
+
+    sdft_loaded = is_sdft_config_dict(peft_cfg)
+    pd_dft_loaded = is_pd_dft_config_dict(peft_cfg)
+    snoft_loaded = is_snoft_config_dict(peft_cfg)
+    psca_loaded = is_psca_wr_config_dict(peft_cfg)
+    if sum([sdft_loaded, pd_dft_loaded, snoft_loaded, psca_loaded]) > 1:
+        raise RuntimeError("SDFT, PD-DFT, SNOFT-E, and PSCA-WR cannot be loaded together.")
+    if snoft_loaded:
+        snoft_config = merge_snoft_config(peft_cfg)
+        target_layers = inject_snoft_adapters(model, snoft_config)
+        if snoft_config.freeze_backbone:
+            mark_only_snoft_as_trainable(model, train_task_head=snoft_config.train_task_head)
+        model.peft_args = {"peft": {"method": "snoft_e", "snoft": snoft_config.to_dict()}}
+        print_snoft_summary(model, snoft_config, target_layers)
+    elif sdft_loaded:
+        sdft_config = merge_sdft_config(peft_cfg)
+        inject_sdft_adapters(model, sdft_config)
+        if sdft_config.sdft_freeze_base_model:
+            freeze_for_sdft(model, train_classifier=sdft_config.sdft_train_classifier)
+        freeze_lm_head_weight_for_sdft(model)
+        model.peft_args = {"peft": peft_cfg}
+    elif pd_dft_loaded:
+        pd_dft_config = merge_pd_dft_config(peft_cfg)
+        inject_pd_dft_adapters(model, pd_dft_config)
+        mark_only_pd_dft_as_trainable(model, train_classifier=True)
+        freeze_lm_head_weight_for_pd_dft(model)
+        model.peft_args = {"peft": peft_cfg}
+    elif psca_loaded:
+        psca_config = merge_psca_wr_config(peft_cfg)
+        target_layers = inject_psca_wr_adapters(model, psca_config)
+        mark_only_psca_wr_as_trainable(model, train_classifier=True)
+        method = "psca_lite" if psca_config.psca_fallback_lite else "psca_wr"
+        model.peft_args = {"peft": {"method": method, **psca_config.to_dict()}}
+        print_psca_wr_summary(model, psca_config, target_layers)
+    else:
+        model, _ = get_mamba_peft_model(model, return_peft_cfg=True, no_print=True, **peft_args)
+    if deep_supervision_args is not None and not (sdft_loaded or pd_dft_loaded or snoft_loaded):
+        from modules.deep_supervision import configure_deep_supervision
+
+        model = configure_deep_supervision(model, no_print=True, **deep_supervision_args)
+        if psca_loaded:
+            mark_only_psca_wr_as_trainable(model, train_classifier=True)
+    elif deep_supervision_args is not None and snoft_loaded:
+        print("[SNOFT-E] Skipping deep supervision while loading SNOFT-E checkpoint.")
+    elif deep_supervision_args is not None and sdft_loaded:
+        print("[SDFT] Skipping deep supervision while loading SDFT checkpoint.")
+    elif deep_supervision_args is not None and pd_dft_loaded:
+        print("[PD-DFT] Skipping deep supervision while loading PD-DFT checkpoint.")
     missing_keys, unexpected_keys = model.load_state_dict(train_state_dict, strict=False)
 
     buffers = set(n for n, _ in model.named_buffers())
@@ -157,7 +230,7 @@ def load_mamba_peft(path):
         if p.requires_grad or n in buffers:
             assert n not in missing_keys
         else:
-            assert n in missing_keys
+            assert n in missing_keys or "s6_attention_bridge" in n
 
     return {
         "model": model, 
@@ -218,10 +291,18 @@ def _load_mamba_tokenizer():
 
 
 def print_trainable_parameter_names(model):
-    print("Trainable parameters:")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ratio = trainable_params / total_params if total_params > 0 else 0
+
+    print("Trainable parameter summary:")
+    print(f"  total params: {total_params:,}")
+    print(f"  trainable params: {trainable_params:,}")
+    print(f"  trainable ratio: {ratio:.6%}")
+    print("Trainable parameter names:")
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print(name)
+            print(f"  {name}")
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
@@ -230,14 +311,98 @@ def get_mamba_peft_model(model, peft, return_peft_cfg=False, train_embedding=Fal
     model_args = getattr(model, "model_args", {})
     peft_args = peft
 
+    if isinstance(peft, (str, Path)):
+        with open(peft, "r") as f:
+            peft = json.load(f)
+
+    from modules.sdft import (
+        freeze_for_sdft,
+        freeze_lm_head_weight_for_sdft,
+        inject_sdft_adapters,
+        is_sdft_config_dict,
+        merge_sdft_config,
+        print_sdft_summary,
+    )
+    from modules.pd_dft import (
+        inject_pd_dft_adapters,
+        is_pd_dft_config_dict,
+        mark_only_pd_dft_as_trainable,
+        merge_pd_dft_config,
+        print_pd_dft_summary,
+    )
+    from modules.snoft import (
+        inject_snoft_adapters,
+        is_snoft_config_dict,
+        mark_only_snoft_as_trainable,
+        merge_snoft_config,
+        print_snoft_summary,
+    )
+    from modules.psca_wr import (
+        inject_psca_wr_adapters,
+        is_psca_wr_config_dict,
+        mark_only_psca_wr_as_trainable,
+        merge_psca_wr_config,
+        print_psca_wr_summary,
+    )
+
+    if is_snoft_config_dict(peft):
+        snoft_config = merge_snoft_config(peft)
+        target_layers = inject_snoft_adapters(model, snoft_config)
+        if snoft_config.freeze_backbone:
+            mark_only_snoft_as_trainable(model, train_task_head=snoft_config.train_task_head)
+        model.model_args = model_args
+        model.peft_args = {"peft": {"method": "snoft_e", "snoft": snoft_config.to_dict()}}
+        if not no_print:
+            print_snoft_summary(model, snoft_config, target_layers)
+        if return_peft_cfg:
+            values = snoft_config.to_dict()
+            method = values.pop("method")
+            return model, SimpleNamespace(method=method, use_snoft=True, **values)
+        return model
+
+    if is_psca_wr_config_dict(peft):
+        psca_config = merge_psca_wr_config(peft)
+        target_layers = inject_psca_wr_adapters(model, psca_config)
+        mark_only_psca_wr_as_trainable(model, train_classifier=True)
+        method = "psca_lite" if psca_config.psca_fallback_lite else "psca_wr"
+        model.model_args = model_args
+        model.peft_args = {"peft": {"method": method, **psca_config.to_dict()}}
+        if not no_print:
+            print_psca_wr_summary(model, psca_config, target_layers)
+        if return_peft_cfg:
+            return model, SimpleNamespace(method=method, **psca_config.to_dict())
+        return model
+
     if hasattr(model, "split_layers"):
         model.split_layers()
     else:
         print("no split_layers")
 
-    if isinstance(peft, (str, Path)):
-        with open(peft, "r") as f:
-            peft = json.load(f)
+    if is_sdft_config_dict(peft):
+        sdft_config = merge_sdft_config(peft)
+        target_layers = inject_sdft_adapters(model, sdft_config)
+        if sdft_config.sdft_freeze_base_model:
+            freeze_for_sdft(model, train_classifier=sdft_config.sdft_train_classifier)
+        freeze_lm_head_weight_for_sdft(model)
+        model.model_args = model_args
+        model.peft_args = {"peft": {"method": "sdft", **sdft_config.to_dict()}}
+        if not no_print:
+            print_sdft_summary(model, sdft_config, target_layers)
+        if return_peft_cfg:
+            return model, SimpleNamespace(method="sdft", **sdft_config.to_dict())
+        return model
+
+    if is_pd_dft_config_dict(peft):
+        pd_dft_config = merge_pd_dft_config(peft)
+        target_layers = inject_pd_dft_adapters(model, pd_dft_config)
+        mark_only_pd_dft_as_trainable(model, train_classifier=True)
+        model.model_args = model_args
+        model.peft_args = {"peft": {"method": "pd_dft", **pd_dft_config.to_dict()}}
+        if not no_print:
+            print_pd_dft_summary(model, pd_dft_config, target_layers)
+        if return_peft_cfg:
+            return model, SimpleNamespace(method="pd_dft", **pd_dft_config.to_dict())
+        return model
 
     if isinstance(peft, list):
         peft = {
@@ -272,6 +437,8 @@ def get_trainable_parameters_ratio(model):
         trainable, all_params = model.get_nb_trainable_parameters()
         trainable_params = trainable / all_params
     else:
-        trainable_params = 1
+        all_params = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        trainable_params = trainable / all_params if all_params > 0 else 0
 
     return trainable_params

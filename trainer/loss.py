@@ -12,7 +12,7 @@ class CrossEntropy(nn.Module):
         return self.crit.ignore_index
 
     def forward(self, input, target):
-        return self.crit(input.view(-1, input.size(-1)), target.view(-1))
+        return self.crit(input.float().reshape(-1, input.size(-1)), target.reshape(-1))
     
 
 class Accuracy(nn.Module):

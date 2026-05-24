@@ -1,0 +1,12 @@
+method: sdft
+batch_size: 4
+data: glue_mnli
+learning_rate: 0.0004
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 3
+output_dir: outputs/sdft/mamba-130m/glue_mnli/seed88
+peft: cfg/final/peft/mamba-130m/glue_mnli/sdft.json
+prec: bf16
+seed: 88
+use_deep_supervision: false

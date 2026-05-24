@@ -1,0 +1,15 @@
+batch_size: 4
+data: glue_cola
+learning_rate: 0.0002
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 10
+peft: cfg/final/peft/mamba-130m/glue_cola/adamix_sot.json
+prec: bf16
+method: adamix_sot
+num_experts: 4
+use_consistency: true
+consistency_lambda: 1.0
+inference_merge: mean
+seed: 88
+output_dir: outputs/adamix_sot/mamba-130m/glue_cola/seed88

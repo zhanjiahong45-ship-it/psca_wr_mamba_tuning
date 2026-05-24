@@ -1,0 +1,13 @@
+{
+  "method": "snoft_e",
+  "snoft": {
+    "enabled": true,
+    "num_groups": 16,
+    "chunk_size": 32,
+    "router_rank": 8,
+    "tau_logit_init": 3.0,
+    "freeze_backbone": true,
+    "train_task_head": true,
+    "sanity_check": true
+  }
+}

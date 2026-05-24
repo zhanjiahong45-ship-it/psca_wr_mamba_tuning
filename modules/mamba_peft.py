@@ -9,6 +9,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from einops import rearrange, repeat
+from modules.s6_attention_bridge import (
+    S6AttentionBridge,
+    is_s6_attention_bridge_active,
+    record_s6_attention_bridge_loss,
+)
 
 from modules.selective_scan_cuda_torch import SelectiveScanCudaTorch
 from modules.selective_scan_split import SelectiveScanSplit
@@ -198,6 +203,13 @@ class MambaPeft(nn.Module):
         self.D._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.s6_attention_bridge = S6AttentionBridge(
+            self.d_state,
+            self.d_inner,
+            device=device,
+            dtype=dtype,
+        )
+        self.s6_attention_bridge.requires_grad_(False)
 
         all_dims = {
             "b": -1, "d": self.d_inner, "l": -1, "n": self.d_state
@@ -249,7 +261,85 @@ class MambaPeft(nn.Module):
         else:
             return param
 
-    def forward(self, hidden_states, inference_params=None):
+    def has_sft_delta_tuning(self):
+        if "x_after_ssm" not in self.parameter_processors:
+            return False
+        processor = self.parameter_processors["x_after_ssm"]
+        has_sft = getattr(processor, "has_sft_delta_tuning", None)
+        return bool(has_sft()) if has_sft is not None else False
+
+    def has_driver_adapter(self):
+        return (
+            (hasattr(self, "sdft_adapter") and self.sdft_adapter is not None)
+            or (hasattr(self, "pd_dft_adapter") and self.pd_dft_adapter is not None)
+        )
+
+    def has_snoft_adapter(self):
+        return bool(getattr(self, "snoft_enabled", False)) and getattr(self, "snoft", None) is not None
+
+    def has_psca_wr_adapter(self):
+        return getattr(self, "psca_wr", None) is not None
+
+    def project_snoft_inputs(self, v_bc, v_delta):
+        if isinstance(self.x_proj, MultiLinearLayer):
+            dt = F.linear(v_delta, self.x_proj.x_proj_dt.weight)
+            B = F.linear(v_bc, self.x_proj.x_proj_B.weight)
+            C = F.linear(v_bc, self.x_proj.x_proj_C.weight)
+            return dt, B, C
+
+        W = self.x_proj.weight
+        W_dt = W[: self.dt_rank]
+        W_B = W[self.dt_rank : self.dt_rank + self.d_state]
+        W_C = W[self.dt_rank + self.d_state :]
+        dt = F.linear(v_delta, W_dt)
+        B = F.linear(v_bc, W_B)
+        C = F.linear(v_bc, W_C)
+        return dt, B, C
+
+    def maybe_run_snoft_sanity_check(self, v, v_bc, v_delta, dt_raw, B, C):
+        if not getattr(self, "snoft_sanity_check", False) or getattr(self, "snoft_sanity_checked", False):
+            return
+
+        with torch.no_grad():
+            if v_bc.shape != v.shape:
+                raise RuntimeError(f"SNOFT-E v_bc shape mismatch: got {tuple(v_bc.shape)}, expected {tuple(v.shape)}")
+            if v_delta.shape != v.shape:
+                raise RuntimeError(f"SNOFT-E v_delta shape mismatch: got {tuple(v_delta.shape)}, expected {tuple(v.shape)}")
+            if dt_raw.shape[-1] != self.dt_rank:
+                raise RuntimeError(f"SNOFT-E dt_raw dim mismatch: got {dt_raw.shape[-1]}, expected {self.dt_rank}")
+            if B.shape[-1] != self.d_state:
+                raise RuntimeError(f"SNOFT-E B dim mismatch: got {B.shape[-1]}, expected {self.d_state}")
+            if C.shape[-1] != self.d_state:
+                raise RuntimeError(f"SNOFT-E C dim mismatch: got {C.shape[-1]}, expected {self.d_state}")
+            if not torch.isfinite(v_bc).all():
+                raise RuntimeError("SNOFT-E v_bc contains NaN or Inf.")
+            if not torch.isfinite(v_delta).all():
+                raise RuntimeError("SNOFT-E v_delta contains NaN or Inf.")
+
+            max_abs_vbc = (v_bc - v).detach().float().abs().max().item()
+            max_abs_vdelta = (v_delta - v).detach().float().abs().max().item()
+            tau_mean = torch.sigmoid(self.snoft.tau_logit.detach().float()).mean().item()
+            alpha_bc = self.snoft.alpha_bc.detach().float().item()
+            alpha_delta = self.snoft.alpha_delta.detach().float().item()
+            print(
+                "[SNOFT-E sanity] "
+                f"v={tuple(v.shape)} v_bc={tuple(v_bc.shape)} v_delta={tuple(v_delta.shape)} "
+                f"dt_raw={tuple(dt_raw.shape)} B={tuple(B.shape)} C={tuple(C.shape)} "
+                f"alpha_bc={alpha_bc:.6g} alpha_delta={alpha_delta:.6g} "
+                f"tau_mean={tau_mean:.6f} max_abs(v_bc-v)={max_abs_vbc:.6g} "
+                f"max_abs(v_delta-v)={max_abs_vdelta:.6g}"
+            )
+
+        self.snoft_sanity_checked = True
+
+    def apply_sft_delta_tuning(self, delta):
+        if "x_after_ssm" not in self.parameter_processors:
+            return delta
+        processor = self.parameter_processors["x_after_ssm"]
+        apply_sft = getattr(processor, "apply_sft_delta_tuning", None)
+        return apply_sft(delta) if apply_sft is not None else delta
+
+    def forward(self, hidden_states, inference_params=None, attention_mask=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -287,7 +377,15 @@ class MambaPeft(nn.Module):
 
         A = -torch.exp(A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
+        if (
+            self.use_fast_path
+            and inference_params is None
+            and not self.has_sft_delta_tuning()
+            and not self.has_driver_adapter()
+            and not self.has_snoft_adapter()
+            and not self.has_psca_wr_adapter()
+            and not is_s6_attention_bridge_active(self, inference_params=inference_params)
+        ):  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -324,16 +422,30 @@ class MambaPeft(nn.Module):
                 )
 
             x = self.process_parameter("x_after_conv", x)
-
-            # We're careful here about the layout, to avoid extra transposes.
-            # We want dt to have d as the slowest moving dimension
-            # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> b l d"))  # (bl d)
-
-            if isinstance(x_dbl, (tuple, list)):
-                dt, B, C = x_dbl
+            x_param = x_scan = x
+            if self.has_snoft_adapter():
+                if self.has_driver_adapter():
+                    raise RuntimeError("SNOFT-E cannot be mixed with SDFT or PD-DFT adapters.")
+                v = rearrange(x, "b d l -> b l d")
+                v_bc, v_delta = self.snoft(v)
+                dt, B, C = self.project_snoft_inputs(v_bc, v_delta)
+                self.maybe_run_snoft_sanity_check(v, v_bc, v_delta, dt, B, C)
+            elif hasattr(self, "pd_dft_adapter") and self.pd_dft_adapter is not None:
+                x_param, x_scan = self.pd_dft_adapter(x, layout="bdl")
             else:
-                dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                if hasattr(self, "sdft_adapter") and self.sdft_adapter is not None:
+                    x = self.sdft_adapter(x, z=z, layout="bdl")
+                    x_param = x_scan = x
+
+                # We're careful here about the layout, to avoid extra transposes.
+                # We want dt to have d as the slowest moving dimension
+                # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+                x_dbl = self.x_proj(rearrange(x_param, "b d l -> b l d"))  # (bl d)
+
+                if isinstance(x_dbl, (tuple, list)):
+                    dt, B, C = x_dbl
+                else:
+                    dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             # dt = self.dt_proj.weight @ dt.t()
             dt = self.dt_proj(dt)
             dt = rearrange(dt, "b l d -> b d l", b=batch)
@@ -354,14 +466,26 @@ class MambaPeft(nn.Module):
             if B.ndim == 3 and C.ndim == 4:
                 B = repeat(B, "b n l -> b d n l", d=C.shape[1])
 
+            if self.has_psca_wr_adapter():
+                psca_source = rearrange(x_param, "b d l -> b l d")
+                psca_delta_u = self.psca_wr.compute_delta_u(psca_source)
+                psca_gate = self.psca_wr.compute_gate(psca_delta_u)
+                x_scan = self.psca_wr.apply_projector_residual(x_scan, psca_delta_u, layout="bdl")
+                if self.psca_wr.fallback_lite:
+                    x_scan = self.psca_wr.apply_lite(
+                        x_scan, psca_source, layout="bdl", delta_u=psca_delta_u, gate=psca_gate
+                    )
+                else:
+                    B, C = self.psca_wr.adapt_bc(B, C, psca_source, delta_u=psca_delta_u, gate=psca_gate)
+
             # add peft cat here, ensure requires grad for columns
             # B D has batch, apply to x_proj instead
             # integrate split in x_proj layer
 
             rem_prefix_with_lora = False
-            if x.shape[2] > z.shape[2]:
+            if x_scan.shape[2] > z.shape[2]:
                 assert self.out_proj.__class__.__name__ == "RemoveSeqPrefixLayer" or self.out_proj.base_layer.__class__.__name__ == "RemoveSeqPrefixLayer"
-                num_pad_tokens = x.shape[2] - z.shape[2]
+                num_pad_tokens = x_scan.shape[2] - z.shape[2]
 
                 if self.out_proj.__class__.__name__ != "RemoveSeqPrefixLayer":
                     # compability
@@ -370,22 +494,48 @@ class MambaPeft(nn.Module):
                 z = torch.nn.functional.pad(z, (num_pad_tokens, 0), value=0)
 
             assert self.activation in ["silu", "swish"]
+            delta_softplus = True
+            if self.has_sft_delta_tuning():
+                # SFT: task-specific forgetting timescale calibration.
+                # delta' = delta * exp(scale * r), applied after softplus to
+                # preserve positivity and pretrained dynamics.
+                dt = F.softplus(dt)
+                dt = self.apply_sft_delta_tuning(dt)
+                delta_softplus = False
+
+            bridge_active = is_s6_attention_bridge_active(self, inference_params=inference_params)
+            scan_z = None if bridge_active else z
             y = self.selective_scan_fn(
-                x,
+                x_scan,
                 dt,
                 A,
                 B,
                 C,
                 D,
-                z=z,
+                z=scan_z,
                 delta_bias=None,  # self.dt_proj.bias.float(),
-                delta_softplus=True,
+                delta_softplus=delta_softplus,
                 return_last_state=ssm_state is not None,
             )
 
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
+            if bridge_active:
+                runtime = self.s6_bridge_runtime
+                y, bridge_stats = self.s6_attention_bridge(
+                    x=x_scan,
+                    B=B,
+                    C=C,
+                    y_s6=y,
+                    attention_mask=attention_mask,
+                    gamma=runtime.get("gamma", 0.0),
+                    compute_soft=runtime.get("compute_soft", False),
+                    compute_linear=runtime.get("compute_linear", False),
+                    compute_losses=True,
+                )
+                record_s6_attention_bridge_loss(self, bridge_stats)
+                y = y * self.act(z)
             y = self.process_parameter("x_after_ssm", y, z=z, A=A, B=B, C=C, D=D, dt=dt)
 
             y = rearrange(y, "b d l -> b l d")
@@ -434,13 +584,30 @@ class MambaPeft(nn.Module):
             )
 
         x = self.process_parameter("x_after_conv", x)
-
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-
-        if isinstance(x_db, (tuple, list)):
-            dt, B, C = x_db
+        x_param = x_scan = x
+        if self.has_snoft_adapter():
+            if self.has_driver_adapter():
+                raise RuntimeError("SNOFT-E cannot be mixed with SDFT or PD-DFT adapters.")
+            v = x.unsqueeze(1)
+            v_bc, v_delta = self.snoft(v)
+            dt, B, C = self.project_snoft_inputs(v_bc, v_delta)
+            self.maybe_run_snoft_sanity_check(v, v_bc, v_delta, dt, B, C)
+            dt = dt.squeeze(1)
+            B = B.squeeze(1)
+            C = C.squeeze(1)
+        elif hasattr(self, "pd_dft_adapter") and self.pd_dft_adapter is not None:
+            x_param, x_scan = self.pd_dft_adapter(x, layout="bd")
         else:
-            dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            if hasattr(self, "sdft_adapter") and self.sdft_adapter is not None:
+                x = self.sdft_adapter(x, z=z, layout="bd")
+                x_param = x_scan = x
+
+            x_db = self.x_proj(x_param)  # (B dt_rank+2*d_state)
+
+            if isinstance(x_db, (tuple, list)):
+                dt, B, C = x_db
+            else:
+                dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         # Don't add dt_bias here
         # dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
         dt = self.dt_proj(dt)
@@ -457,18 +624,44 @@ class MambaPeft(nn.Module):
         C = self.process_parameter("C", C)
         D = self.process_parameter("D", D)
 
+        if self.has_psca_wr_adapter():
+            psca_source = x_param.unsqueeze(1)
+            psca_delta_u = self.psca_wr.compute_delta_u(psca_source)
+            psca_gate = self.psca_wr.compute_gate(psca_delta_u)
+            x_scan = self.psca_wr.apply_projector_residual(x_scan, psca_delta_u, layout="bd")
+            if self.psca_wr.fallback_lite:
+                x_scan = self.psca_wr.apply_lite(
+                    x_scan, psca_source, layout="bd", delta_u=psca_delta_u, gate=psca_gate
+                )
+            else:
+                B, C = self.psca_wr.adapt_bc(B, C, psca_source, delta_u=psca_delta_u, gate=psca_gate)
+
+        has_sft_delta_tuning = self.has_sft_delta_tuning()
         if B.ndim == 3 or C.ndim == 3 or selective_state_update is None:
             # Discretize A and B
             dt = F.softplus(dt)  # + self.dt_proj.bias.to(dtype=dt.dtype)
+            if has_sft_delta_tuning:
+                # SFT: task-specific forgetting timescale calibration.
+                # delta' = delta * exp(scale * r), applied after softplus to
+                # preserve positivity and pretrained dynamics.
+                dt = self.apply_sft_delta_tuning(dt)
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn" if B.ndim == 2 else "bd,bdn->bdn", dt, B)
-            ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+            ssm_state.copy_(ssm_state * dA + rearrange(x_scan, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd" if C.ndim == 2 else "bdn,bdn->bd", ssm_state.to(dtype), C)
-            y = y + D.to(dtype) * x
+            y = y + D.to(dtype) * x_scan
             y = y * self.act(z)  # (B D)
         else:
+            dt_softplus = True
+            if has_sft_delta_tuning:
+                # SFT: task-specific forgetting timescale calibration.
+                # delta' = delta * exp(scale * r), applied after softplus to
+                # preserve positivity and pretrained dynamics.
+                dt = F.softplus(dt)
+                dt = self.apply_sft_delta_tuning(dt)
+                dt_softplus = False
             y = selective_state_update(
-                ssm_state, x, dt, A, B, C, D, z=z, dt_bias=None, dt_softplus=True
+                ssm_state, x_scan, dt, A, B, C, D, z=z, dt_bias=None, dt_softplus=dt_softplus
             )
 
         y = self.process_parameter("x_after_ssm", y, z=z, A=A, B=B, C=C, D=D, dt=dt)
@@ -552,7 +745,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, attention_mask=None
     ):
         r"""Pass the input through the encoder layer.
 
@@ -576,7 +769,7 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params, attention_mask=attention_mask)
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

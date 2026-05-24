@@ -1,0 +1,18 @@
+{
+  "method": "pd_dft",
+  "use_pd_dft": true,
+  "pd_dft_rank": 4,
+  "pd_dft_dropout": 0.05,
+  "pd_dft_rho_param_init": 0.05,
+  "pd_dft_rho_scan_init": 0.05,
+  "pd_dft_learnable_rho": true,
+  "pd_dft_mode": "param_only",
+  "pd_dft_target_layers": "all",
+  "pd_dft_share_down": true,
+  "pd_dft_max_delta_ratio_param": null,
+  "pd_dft_max_delta_ratio_scan": null,
+  "pd_dft_log_stats": true,
+  "pd_dft_log_per_layer": false,
+  "pd_dft_log_grad": true,
+  "pd_dft_log_interval": null
+}

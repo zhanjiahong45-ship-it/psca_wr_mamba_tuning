@@ -1,0 +1,35 @@
+method: probe_then_adapt_ds_sot
+model: state-spaces/mamba-130m
+data: glue_rte
+peft: cfg/final/peft/mamba-130m/glue_rte/probe_then_adapt_ds_sot.json
+use_deep_supervision: true
+ds_adaptive: true
+ds_adaptive_strategy: loss_drop
+candidate_aux_layers: [4, 8, 12, 16, 20, 24]
+probe_ratio: 0.15
+probe_aux_weight: 0.05
+probe_start_window_ratio: 0.3
+probe_end_window_ratio: 0.3
+probe_loss_stat: window_mean
+adaptive_top_k: 3
+adaptive_late_bias_gamma: 1.0
+adaptive_score_mode: drop_plus_confidence
+adaptive_confidence_weight: 0.1
+adaptive_score_threshold: 0.02
+adaptive_min_layer: 0
+adaptive_disable_if_low_score: false
+fallback_aux_layers: [16, 20, 24]
+fallback_aux_weight_scheme: linear_increase
+fallback_aux_loss_weight_scale: 0.5
+fallback_confidence_threshold: 0.0
+aux_loss_weight: 0.1
+aux_weight_scheme: adaptive
+aux_pooling: last_token
+ds_schedule: linear_warmup
+ds_start_ratio: 0.15
+ds_warmup_ratio: 0.3
+num_epochs: 10
+batch_size: 4
+learning_rate: 0.001
+no_save: false
+prec: bf16

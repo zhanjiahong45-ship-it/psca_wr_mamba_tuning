@@ -11,6 +11,11 @@ from torch import Tensor
 from einops import rearrange, repeat
 
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref, selective_scan_naiv, mamba_inner_fn
+from mamba_ssm.modules.s6_attention_bridge import (
+    S6AttentionBridge,
+    is_s6_attention_bridge_active,
+    record_s6_attention_bridge_loss,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -123,8 +128,15 @@ class Mamba(nn.Module):
         self.D._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.s6_attention_bridge = S6AttentionBridge(
+            self.d_state,
+            self.d_inner,
+            device=device,
+            dtype=dtype,
+        )
+        self.s6_attention_bridge.requires_grad_(False)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, attention_mask=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -150,7 +162,11 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
+        if (
+            self.use_fast_path
+            and inference_params is None
+            and not is_s6_attention_bridge_active(self, inference_params=inference_params)
+        ):  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -198,6 +214,8 @@ class Mamba(nn.Module):
             D = self.D
 
             assert self.activation in ["silu", "swish"]
+            bridge_active = is_s6_attention_bridge_active(self, inference_params=inference_params)
+            scan_z = None if bridge_active else z
             y = self.selective_scan_fn(
                 x,
                 dt,
@@ -205,7 +223,7 @@ class Mamba(nn.Module):
                 B,
                 C,
                 D,
-                z=z,
+                z=scan_z,
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
                 return_last_state=ssm_state is not None,
@@ -213,6 +231,21 @@ class Mamba(nn.Module):
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
+            if bridge_active:
+                runtime = self.s6_bridge_runtime
+                y, bridge_stats = self.s6_attention_bridge(
+                    x=x,
+                    B=B,
+                    C=C,
+                    y_s6=y,
+                    attention_mask=attention_mask,
+                    gamma=runtime.get("gamma", 0.0),
+                    compute_soft=runtime.get("compute_soft", False),
+                    compute_linear=runtime.get("compute_linear", False),
+                    compute_losses=True,
+                )
+                record_s6_attention_bridge_loss(self, bridge_stats)
+                y = y * self.act(z)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
         return out
@@ -334,7 +367,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, attention_mask=None
     ):
         r"""Pass the input through the encoder layer.
 
@@ -358,7 +391,7 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params, attention_mask=attention_mask)
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

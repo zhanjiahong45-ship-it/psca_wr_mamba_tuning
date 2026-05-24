@@ -1,0 +1,12 @@
+{
+  "peft_type": "SUFFIX_TUNING",
+  "method": "sot_sft",
+  "bias_init": "ZERO",
+  "bias_type": "SILU_Z_C",
+  "use_sft": true,
+  "sft_type": "channel",
+  "sft_delta_scale": 0.01,
+  "sft_clamp": 0.2,
+  "sft_init": "zero",
+  "sft_apply_position": "after_softplus"
+}

@@ -1,0 +1,13 @@
+{
+  "peft_type": "SUFFIX_TUNING",
+  "bias_init": "ZERO",
+  "bias_type": "SILU_Z_C",
+  "use_tf_sot": true,
+  "tf_sot_num_freqs": 4,
+  "tf_sot_num_basis": 8,
+  "tf_sot_eps": 0.1,
+  "tf_sot_max_seq_len": 256,
+  "tf_sot_freq_grid": "geometric",
+  "tf_sot_normalize_basis": true,
+  "tf_sot_init_coeff": "zero"
+}

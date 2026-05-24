@@ -1,0 +1,17 @@
+{
+  "peft_type": "SUFFIX_TUNING",
+  "bias_init": "ZERO",
+  "bias_type": "SILU_Z_C",
+  "use_tf_sot": false,
+  "use_cf_sot": true,
+  "cf_sot_num_freqs": 4,
+  "cf_sot_num_basis": 8,
+  "cf_sot_eps": 0.1,
+  "cf_sot_max_seq_len": 256,
+  "cf_sot_freq_grid": "geometric",
+  "cf_sot_normalize_basis": true,
+  "cf_sot_context_center": true,
+  "cf_sot_context_reduce": "mean",
+  "cf_sot_init_tf_coeff": "zero",
+  "cf_sot_init_context_alpha": "zero"
+}

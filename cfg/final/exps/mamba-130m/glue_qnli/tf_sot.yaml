@@ -1,0 +1,9 @@
+batch_size: 4
+data: glue_qnli
+learning_rate: 0.0001
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 10
+output_dir: outputs/tf_sot/mamba-130m/glue_qnli
+peft: cfg/final/peft/mamba-130m/glue_qnli/tf_sot.json
+prec: bf16

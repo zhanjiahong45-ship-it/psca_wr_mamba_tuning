@@ -1,0 +1,10 @@
+{
+  "peft_type": "SUFFIX_TUNING",
+  "method": "adamix_sot",
+  "bias_init": "ZERO",
+  "bias_type": "SILU_Z_C",
+  "num_experts": 4,
+  "use_consistency": true,
+  "consistency_lambda": 1.0,
+  "inference_merge": "mean"
+}

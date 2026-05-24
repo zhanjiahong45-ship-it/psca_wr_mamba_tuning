@@ -1,0 +1,20 @@
+batch_size: 4
+data: glue_cola
+learning_rate: 0.0002
+method: snoft_e
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 10
+output_dir: outputs/snoft_e/mamba-130m/glue_cola
+peft: cfg/final/peft/mamba-130m/glue_cola/snoft_e.json
+prec: bf16
+seed: 88
+use_deep_supervision: false
+snoft:
+  enabled: true
+  num_groups: 16
+  chunk_size: 32
+  router_rank: 8
+  tau_logit_init: 3.0
+  freeze_backbone: true
+  train_task_head: true

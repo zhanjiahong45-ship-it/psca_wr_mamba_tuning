@@ -1,0 +1,15 @@
+{
+  "method": "sdft",
+  "use_sdft": true,
+  "sdft_rank": 4,
+  "sdft_rho_init": 0.05,
+  "sdft_gate_mode": "none",
+  "sdft_dropout": 0.05,
+  "sdft_target_layers": "all",
+  "sdft_freeze_base_model": true,
+  "sdft_train_classifier": true,
+  "sdft_log_stats": true,
+  "sdft_log_interval": null,
+  "sdft_log_per_layer": false,
+  "sdft_log_grad": true
+}
