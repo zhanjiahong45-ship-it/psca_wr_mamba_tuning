@@ -979,7 +979,7 @@ def run_train(args):
             output_dir=args.output_dir,
             logging_steps=logging_steps,
             dataloader_num_workers=dataloader_num_workers,
-            dataloader_prefetch_factor=2,
+            dataloader_prefetch_factor=2 if dataloader_num_workers > 0 else None,
             eval_accumulation_steps=128,
             info={
                 "trainable_params": get_trainable_parameters_ratio(model),
@@ -1228,6 +1228,7 @@ def main():
     parser.add_argument("--metric_for_best_model")
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--num_data_workers", type=int)
     parser.add_argument("--num_train_epochs", type=int)
     parser.add_argument("--num_epochs", type=int)
     parser.add_argument("--tune_lm_head_only", type=str2bool)
