@@ -172,11 +172,19 @@ def load_mamba_peft(path):
         merge_psca_wr_config,
         print_psca_wr_summary,
     )
+    from modules.linear_lora import (
+        inject_lora_linear_adapters,
+        is_lora_config_dict,
+        mark_only_lora_as_trainable,
+        merge_lora_config,
+        print_lora_summary,
+    )
 
     sdft_loaded = is_sdft_config_dict(peft_cfg)
     pd_dft_loaded = is_pd_dft_config_dict(peft_cfg)
     snoft_loaded = is_snoft_config_dict(peft_cfg)
     psca_loaded = is_psca_wr_config_dict(peft_cfg)
+    lora_loaded = is_lora_config_dict(peft_cfg)
     if sum([sdft_loaded, pd_dft_loaded, snoft_loaded, psca_loaded]) > 1:
         raise RuntimeError("SDFT, PD-DFT, SNOFT-E, and PSCA-WR cannot be loaded together.")
     if snoft_loaded:
@@ -202,10 +210,27 @@ def load_mamba_peft(path):
     elif psca_loaded:
         psca_config = merge_psca_wr_config(peft_cfg)
         target_layers = inject_psca_wr_adapters(model, psca_config)
-        mark_only_psca_wr_as_trainable(model, train_classifier=True)
+        lora_targets = []
+        if lora_loaded:
+            lora_config = merge_lora_config(peft_cfg)
+            lora_targets = inject_lora_linear_adapters(model, lora_config)
+        mark_only_psca_wr_as_trainable(model, train_classifier=True, train_lora=lora_loaded)
         method = "psca_lite" if psca_config.psca_fallback_lite else "psca_wr"
-        model.peft_args = {"peft": {"method": method, **psca_config.to_dict()}}
+        peft_payload = {"method": method, **psca_config.to_dict()}
+        if lora_loaded:
+            method = f"{method}_lora_inoutproj"
+            peft_payload = {"method": method, **psca_config.to_dict(), **lora_config.to_dict()}
+        model.peft_args = {"peft": peft_payload}
         print_psca_wr_summary(model, psca_config, target_layers)
+        if lora_loaded:
+            print_lora_summary(model, lora_config, lora_targets)
+    elif lora_loaded:
+        lora_config = merge_lora_config(peft_cfg)
+        lora_targets = inject_lora_linear_adapters(model, lora_config)
+        mark_only_lora_as_trainable(model, train_classifier=True)
+        method = "lora_inoutproj"
+        model.peft_args = {"peft": {"method": method, **lora_config.to_dict()}}
+        print_lora_summary(model, lora_config, lora_targets)
     else:
         model, _ = get_mamba_peft_model(model, return_peft_cfg=True, no_print=True, **peft_args)
     if deep_supervision_args is not None and not (sdft_loaded or pd_dft_loaded or snoft_loaded):
@@ -213,7 +238,9 @@ def load_mamba_peft(path):
 
         model = configure_deep_supervision(model, no_print=True, **deep_supervision_args)
         if psca_loaded:
-            mark_only_psca_wr_as_trainable(model, train_classifier=True)
+            mark_only_psca_wr_as_trainable(model, train_classifier=True, train_lora=lora_loaded)
+        elif lora_loaded:
+            mark_only_lora_as_trainable(model, train_classifier=True)
     elif deep_supervision_args is not None and snoft_loaded:
         print("[SNOFT-E] Skipping deep supervision while loading SNOFT-E checkpoint.")
     elif deep_supervision_args is not None and sdft_loaded:
@@ -344,6 +371,13 @@ def get_mamba_peft_model(model, peft, return_peft_cfg=False, train_embedding=Fal
         merge_psca_wr_config,
         print_psca_wr_summary,
     )
+    from modules.linear_lora import (
+        inject_lora_linear_adapters,
+        is_lora_config_dict,
+        mark_only_lora_as_trainable,
+        merge_lora_config,
+        print_lora_summary,
+    )
 
     if is_snoft_config_dict(peft):
         snoft_config = merge_snoft_config(peft)
@@ -363,14 +397,39 @@ def get_mamba_peft_model(model, peft, return_peft_cfg=False, train_embedding=Fal
     if is_psca_wr_config_dict(peft):
         psca_config = merge_psca_wr_config(peft)
         target_layers = inject_psca_wr_adapters(model, psca_config)
-        mark_only_psca_wr_as_trainable(model, train_classifier=True)
+        lora_loaded = is_lora_config_dict(peft)
+        lora_targets = []
+        if lora_loaded:
+            lora_config = merge_lora_config(peft)
+            lora_targets = inject_lora_linear_adapters(model, lora_config)
+        mark_only_psca_wr_as_trainable(model, train_classifier=True, train_lora=lora_loaded)
         method = "psca_lite" if psca_config.psca_fallback_lite else "psca_wr"
+        peft_payload = {"method": method, **psca_config.to_dict()}
+        if lora_loaded:
+            method = f"{method}_lora_inoutproj"
+            peft_payload = {"method": method, **psca_config.to_dict(), **lora_config.to_dict()}
         model.model_args = model_args
-        model.peft_args = {"peft": {"method": method, **psca_config.to_dict()}}
+        model.peft_args = {"peft": peft_payload}
         if not no_print:
             print_psca_wr_summary(model, psca_config, target_layers)
+            if lora_loaded:
+                print_lora_summary(model, lora_config, lora_targets)
         if return_peft_cfg:
-            return model, SimpleNamespace(method=method, **psca_config.to_dict())
+            return model, SimpleNamespace(**peft_payload)
+        return model
+
+    if is_lora_config_dict(peft):
+        lora_config = merge_lora_config(peft)
+        lora_targets = inject_lora_linear_adapters(model, lora_config)
+        mark_only_lora_as_trainable(model, train_classifier=True)
+        method = "lora_inoutproj"
+        peft_payload = {"method": method, **lora_config.to_dict()}
+        model.model_args = model_args
+        model.peft_args = {"peft": peft_payload}
+        if not no_print:
+            print_lora_summary(model, lora_config, lora_targets)
+        if return_peft_cfg:
+            return model, SimpleNamespace(**peft_payload)
         return model
 
     if hasattr(model, "split_layers"):

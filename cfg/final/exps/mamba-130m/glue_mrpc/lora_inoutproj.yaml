@@ -1,0 +1,22 @@
+method: lora_inoutproj
+batch_size: 8
+data: glue_mrpc
+learning_rate: 0.001
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 10
+output_dir: outputs/lora_inoutproj/mamba-130m/glue_mrpc/seed88
+prec: bf16
+seed: 88
+bridge_enabled: false
+use_deep_supervision: false
+use_psca_wr: false
+use_lora: true
+lora_rank: 8
+lora_alpha: 8
+lora_dropout: 0.1
+lora_bias: none
+lora_target_modules:
+  - in_proj_x
+  - in_proj_z
+  - out_proj

@@ -1,0 +1,34 @@
+method: psca_wr_lora_inoutproj
+batch_size: 16
+data: glue_cola
+learning_rate: 0.002
+model: state-spaces/mamba-130m
+no_save: false
+num_epochs: 10
+output_dir: outputs/psca_wr_lora_inoutproj/mamba-130m/glue_cola/seed88_lr0.002_bs16
+prec: bf16
+seed: 42
+bridge_enabled: false
+use_deep_supervision: false
+use_psca_wr: true
+psca_rank: 8
+psca_alpha: 1.0
+psca_dropout: 0.0
+psca_adapt_b: true
+psca_adapt_c: true
+psca_init_zero: true
+psca_use_projector_shift: true
+psca_projector_residual: true
+psca_projector_scale: 0.01
+psca_fallback_lite: false
+psca_random_gate: false
+psca_independent_gate: false
+use_lora: true
+lora_rank: 8
+lora_alpha: 8
+lora_dropout: 0.1
+lora_bias: none
+lora_target_modules:
+  - in_proj_x
+  - in_proj_z
+  - out_proj

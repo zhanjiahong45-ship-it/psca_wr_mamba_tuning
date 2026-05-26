@@ -502,13 +502,23 @@ def _is_small_classifier_param(name: str) -> bool:
     return any(token in lowered for token in ("classifier", "classification_head", "score", "predictor"))
 
 
-def mark_only_psca_wr_as_trainable(model: nn.Module, train_classifier: bool = True) -> None:
+def _is_lora_param_name(name: str) -> bool:
+    return "lora_" in name.lower()
+
+
+def mark_only_psca_wr_as_trainable(
+    model: nn.Module,
+    train_classifier: bool = True,
+    train_lora: bool = False,
+) -> None:
     for _, param in model.named_parameters():
         param.requires_grad = False
 
     for name, param in model.named_parameters():
         lowered = name.lower()
         if ".psca_wr." in lowered or "psca_" in lowered:
+            param.requires_grad = True
+        elif train_lora and _is_lora_param_name(name):
             param.requires_grad = True
         elif train_classifier and _is_small_classifier_param(name):
             param.requires_grad = True

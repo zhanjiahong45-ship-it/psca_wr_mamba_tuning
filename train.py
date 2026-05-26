@@ -69,6 +69,16 @@ from modules.psca_wr import (
     merge_psca_wr_config,
     print_psca_wr_summary,
 )
+from modules.linear_lora import (
+    LinearLoRAConfig,
+    freeze_lm_head_weight_for_lora,
+    get_lora_trainable_parameter_counts,
+    inject_lora_linear_adapters,
+    is_lora_config_dict,
+    mark_only_lora_as_trainable,
+    merge_lora_config,
+    print_lora_summary,
+)
 from dataset import load_dataset
 from trainer.mamba_trainer import MambaTrainer, MambaTrainingArguments
 
@@ -155,7 +165,10 @@ def get_method_name(peft_path):
         return "snoft_e"
 
     if is_psca_wr_config_dict(peft_cfg):
-        return "psca_lite" if bool(peft_cfg.get("psca_fallback_lite", False)) else "psca_wr"
+        method = "psca_lite" if bool(peft_cfg.get("psca_fallback_lite", False)) else "psca_wr"
+        return f"{method}_lora_inoutproj" if is_lora_config_dict(peft_cfg) else method
+    if is_lora_config_dict(peft_cfg):
+        return "lora_inoutproj"
 
     if peft_cfg.get("method") in ("adamix_sot", "sot_sft", "sot_ds", "probe_then_adapt_ds_sot"):
         return peft_cfg.get("method")
@@ -279,6 +292,7 @@ def print_sft_parameter_summary(model):
 def save_results_json(args, method_name, peft_cfg, trainer):
     total_params, trainable_params, trainable_percentage = get_parameter_counts(trainer.model)
     trainable_ratio = trainable_percentage / 100.0
+    lora_trainable_counts = get_lora_trainable_parameter_counts(trainer.model)
 
     def _extract_eval_metrics():
         metric_name = getattr(args, "metric_for_best_model", None)
@@ -333,6 +347,16 @@ def save_results_json(args, method_name, peft_cfg, trainer):
         "psca_projector_residual": get_peft_attr(peft_cfg, "psca_projector_residual"),
         "psca_projector_scale": get_peft_attr(peft_cfg, "psca_projector_scale"),
         "psca_fallback_lite": get_peft_attr(peft_cfg, "psca_fallback_lite"),
+        "use_lora": get_peft_attr(peft_cfg, "use_lora"),
+        "lora_rank": get_peft_attr(peft_cfg, "lora_rank"),
+        "lora_alpha": get_peft_attr(peft_cfg, "lora_alpha"),
+        "lora_dropout": get_peft_attr(peft_cfg, "lora_dropout"),
+        "lora_bias": get_peft_attr(peft_cfg, "lora_bias"),
+        "lora_target_modules": get_peft_attr(peft_cfg, "lora_target_modules"),
+        "lora_trainable_params": lora_trainable_counts.get("lora"),
+        "psca_wr_trainable_params": lora_trainable_counts.get("psca_wr"),
+        "classifier_trainable_params": lora_trainable_counts.get("classifier"),
+        "other_trainable_params": lora_trainable_counts.get("other"),
     }
 
     payload = {
@@ -433,6 +457,16 @@ def save_results_json(args, method_name, peft_cfg, trainer):
         "psca_fallback_lite": get_peft_attr(peft_cfg, "psca_fallback_lite"),
         "psca_random_gate": get_peft_attr(peft_cfg, "psca_random_gate"),
         "psca_independent_gate": get_peft_attr(peft_cfg, "psca_independent_gate"),
+        "use_lora": get_peft_attr(peft_cfg, "use_lora"),
+        "lora_rank": get_peft_attr(peft_cfg, "lora_rank"),
+        "lora_alpha": get_peft_attr(peft_cfg, "lora_alpha"),
+        "lora_dropout": get_peft_attr(peft_cfg, "lora_dropout"),
+        "lora_bias": get_peft_attr(peft_cfg, "lora_bias"),
+        "lora_target_modules": get_peft_attr(peft_cfg, "lora_target_modules"),
+        "lora_trainable_params": lora_trainable_counts.get("lora"),
+        "psca_wr_trainable_params": lora_trainable_counts.get("psca_wr"),
+        "classifier_trainable_params": lora_trainable_counts.get("classifier"),
+        "other_trainable_params": lora_trainable_counts.get("other"),
         "eval_accuracy": eval_metrics.get("accuracy"),
         "eval_f1": eval_metrics.get("f1"),
         "eval_matthews_correlation": eval_metrics.get("matthews_correlation"),
@@ -566,10 +600,23 @@ def run_train(args):
         psca_overrides["psca_debug"] = True
     psca_config = merge_psca_wr_config(peft_cfg_dict, SimpleNamespace(**psca_overrides))
     psca_requested = bool(psca_config.use_psca_wr)
-    if psca_requested and args.peft is not None and not is_psca_wr_config_dict(peft_cfg_dict):
-        raise RuntimeError("[PSCA-WR] Do not combine PSCA-WR CLI flags with a non-PSCA PEFT config.")
+    lora_overrides = {
+        key: getattr(args, key)
+        for key in LinearLoRAConfig.__dataclass_fields__.keys()
+        if key in explicit_keys and hasattr(args, key)
+    }
+    if "lora" in str(getattr(args, "method", "")).lower():
+        lora_overrides["use_lora"] = True
+    lora_config = merge_lora_config(peft_cfg_dict, SimpleNamespace(**lora_overrides))
+    lora_requested = bool(lora_config.use_lora)
+    if psca_requested and args.peft is not None and not (
+        is_psca_wr_config_dict(peft_cfg_dict) or is_lora_config_dict(peft_cfg_dict)
+    ):
+        raise RuntimeError("[PSCA-WR] Do not combine PSCA-WR CLI flags with a non-PSCA/non-LoRA PEFT config.")
     if sum([sdft_requested, pd_dft_requested, snoft_requested, psca_requested]) > 1:
         raise RuntimeError("SDFT, PD-DFT, SNOFT-E, and PSCA-WR cannot be enabled together.")
+    if lora_requested and (sdft_requested or pd_dft_requested or snoft_requested):
+        raise RuntimeError("LoRA(in_proj_x,in_proj_z,out_proj) is currently supported alone or with PSCA-WR only.")
     if sdft_requested:
         sdft_config.use_sdft = True
         for key, value in sdft_config.to_dict().items():
@@ -587,6 +634,10 @@ def run_train(args):
         psca_config.use_psca_wr = True
         for key, value in psca_config.to_dict().items():
             setattr(args, key, value)
+    if lora_requested:
+        lora_config.use_lora = True
+        for key, value in lora_config.to_dict().items():
+            setattr(args, key, value)
 
     is_custom_tokenizer = False
     # is_custom_tokenizer = args.tokenizer != "EleutherAI/gpt-neox-20b"
@@ -596,7 +647,7 @@ def run_train(args):
         dtype={"bf16": torch.bfloat16, "fp16": torch.bfloat16, "fp32": torch.float32}[args.prec],
         device="cuda",
         use_fast_path=False,
-        mamba_cls=MambaPeft if sdft_requested or pd_dft_requested or snoft_requested or psca_requested or (args.peft is not None and not lm_head_full_requested) else Mamba,
+        mamba_cls=MambaPeft if sdft_requested or pd_dft_requested or snoft_requested or psca_requested or lora_requested or (args.peft is not None and not lm_head_full_requested) else Mamba,
         backend=args.backend,
     )
 
@@ -619,6 +670,7 @@ def run_train(args):
     pd_dft_target_layers = []
     snoft_target_layers = []
     psca_target_layers = []
+    lora_target_modules = []
     if sdft_requested and not lm_head_full_requested:
         sdft_target_layers = inject_sdft_adapters(model, sdft_config)
         peft_cfg = SimpleNamespace(method="sdft", **sdft_config.to_dict())
@@ -658,12 +710,24 @@ def run_train(args):
                 **psca_config.to_dict(),
             }
         }
-    elif args.peft is not None and not lm_head_full_requested:
+    elif args.peft is not None and not lm_head_full_requested and not lora_requested:
         model, peft_cfg = get_mamba_peft_model(model, args.peft, return_peft_cfg=True, train_embedding=is_custom_tokenizer, no_print=True)
     else:
         if lm_head_full_requested and args.peft is not None:
             print(f"[LM_HEAD_FULL] Skipping PEFT config for lm_head-only tuning: {args.peft}")
         peft_cfg = None
+
+    if lora_requested and not lm_head_full_requested:
+        lora_target_modules = inject_lora_linear_adapters(model, lora_config)
+        if psca_requested:
+            base_method = "psca_lite" if psca_config.psca_fallback_lite else "psca_wr"
+            peft_method = f"{base_method}_lora_inoutproj"
+            peft_payload = {"method": peft_method, **psca_config.to_dict(), **lora_config.to_dict()}
+        else:
+            peft_method = "lora_inoutproj"
+            peft_payload = {"method": peft_method, **lora_config.to_dict()}
+        peft_cfg = SimpleNamespace(**peft_payload)
+        model.peft_args = {"peft": peft_payload}
 
     if lm_head_full_requested and args.train_all_peft:
         raise RuntimeError("[LM_HEAD_FULL] train_all_peft=True conflicts with lm_head-only tuning.")
@@ -675,6 +739,8 @@ def run_train(args):
         raise RuntimeError("[SNOFT-E] train_all_peft=True conflicts with independent SNOFT-E tuning.")
     if psca_requested and args.train_all_peft:
         raise RuntimeError("[PSCA-WR] train_all_peft=True conflicts with independent PSCA-WR tuning.")
+    if lora_requested and args.train_all_peft:
+        raise RuntimeError("[LoRA] train_all_peft=True conflicts with custom LoRA(inoutproj) tuning.")
 
     if args.train_all_peft:
         lora = model.base_model.model.base_model
@@ -748,8 +814,11 @@ def run_train(args):
         else "pd_dft" if pd_dft_requested and not lm_head_full_requested
         else "snoft_e" if snoft_requested and not lm_head_full_requested
         else ("psca_lite" if psca_requested and psca_config.psca_fallback_lite and not lm_head_full_requested else "psca_wr") if psca_requested and not lm_head_full_requested
+        else "lora_inoutproj" if lora_requested and not lm_head_full_requested
         else ("lm_head_full" if lm_head_full_requested else (getattr(args, "method", None) or get_method_name(args.peft)))
     )
+    if lora_requested and psca_requested and not lm_head_full_requested:
+        method_name = f"{method_name}_lora_inoutproj"
     if deep_supervision_requested and getattr(args, "ds_adaptive", False) and method_name in ("sot", "sot_ds"):
         method_name = "probe_then_adapt_ds_sot"
     if deep_supervision_requested and method_name == "sot":
@@ -780,8 +849,11 @@ def run_train(args):
         bridge_log_interval=getattr(args, "bridge_log_interval", 10),
     )
     if psca_requested and not lm_head_full_requested:
-        mark_only_psca_wr_as_trainable(model, train_classifier=True)
+        mark_only_psca_wr_as_trainable(model, train_classifier=True, train_lora=lora_requested)
         freeze_lm_head_weight_for_psca_wr(model)
+    elif lora_requested and not lm_head_full_requested:
+        mark_only_lora_as_trainable(model, train_classifier=True)
+        freeze_lm_head_weight_for_lora(model)
     print(f"Task: {args.data}")
     print(f"Method: {method_name}")
     print(f"Seed: {args.seed}")
@@ -797,6 +869,8 @@ def run_train(args):
         print_snoft_summary(model, snoft_config, snoft_target_layers)
     if psca_requested and not lm_head_full_requested:
         print_psca_wr_summary(model, psca_config, psca_target_layers)
+    if lora_requested and not lm_head_full_requested:
+        print_lora_summary(model, lora_config, lora_target_modules)
 
     print("Loaded model")
 
@@ -1112,6 +1186,12 @@ def main():
     parser.add_argument("--psca_fallback_lite", type=str2bool)
     parser.add_argument("--psca_random_gate", type=str2bool)
     parser.add_argument("--psca_independent_gate", type=str2bool)
+    parser.add_argument("--use_lora", type=str2bool)
+    parser.add_argument("--lora_rank", type=int)
+    parser.add_argument("--lora_alpha", type=float)
+    parser.add_argument("--lora_dropout", type=float)
+    parser.add_argument("--lora_bias")
+    parser.add_argument("--lora_target_modules", nargs="*")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output_dir")
     parser.add_argument("--metric_for_best_model")
@@ -1240,6 +1320,12 @@ def main():
         "psca_random_gate": False,
         "psca_independent_gate": False,
         "psca_debug": False,
+        "use_lora": False,
+        "lora_rank": 8,
+        "lora_alpha": 8.0,
+        "lora_dropout": 0.1,
+        "lora_bias": "none",
+        "lora_target_modules": "in_proj_x,in_proj_z,out_proj",
         "tune_lm_head_only": False,
         "use_deep_supervision": False,
         "aux_layers": [],
