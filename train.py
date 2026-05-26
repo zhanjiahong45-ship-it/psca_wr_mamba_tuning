@@ -3,6 +3,7 @@ from functools import partial
 import json
 import os
 from pathlib import Path
+import random
 import sys
 from types import SimpleNamespace
 from typing import Dict, Any
@@ -115,6 +116,21 @@ def str2bool(value):
     if value in ("false", "0", "no", "n"):
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def set_global_seed(seed, deterministic=False):
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def normalize_glue_task_name(task_name):
@@ -536,6 +552,14 @@ def init_embedding(model, tokenizer):
 
 
 def run_train(args):
+    set_global_seed(args.seed, deterministic=getattr(args, "deterministic", False))
+    print("==== Reproducibility Config ====")
+    print(f"seed: {args.seed}")
+    print(f"data_seed: {args.seed}")
+    print(f"deterministic: {getattr(args, 'deterministic', False)}")
+    print(f"dataloader_num_workers: {getattr(args, 'num_data_workers', None)}")
+    print("===============================")
+
     if args.overwrite and args.sdt:
         assert Path(args.output_dir).exists()
 
@@ -1085,6 +1109,7 @@ def run_train(args):
             greater_is_better=True,
             dataloader_drop_last=val_data_module.dataset.eval_type != "log_likelihood", # only ll works for batch
             seed=args.seed,
+            data_seed=args.seed,
             run_name=run_name,
             report_to=get_report_to(),
         ),
@@ -1125,6 +1150,12 @@ def main():
     parser.add_argument("--sdt", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=None,
+        help="Enable stricter deterministic behavior for debugging reproducibility.",
+    )
     parser.add_argument("--skip_metrics", action="store_true")
     parser.add_argument("--skip_eval", action="store_true")
     parser.add_argument("--model")
@@ -1264,6 +1295,7 @@ def main():
         "train_all_peft": False,
         "skip_metrics": False,
         "seed": 42,
+        "deterministic": False,
         "log_speed": False,
         "metric_for_best_model": None,
         "method": None,
